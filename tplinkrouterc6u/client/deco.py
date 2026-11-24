@@ -5,6 +5,7 @@ from json import dumps
 from math import isfinite
 from time import sleep
 from types import MappingProxyType
+from urllib.parse import urlsplit
 from requests.exceptions import Timeout
 from collections.abc import Callable, Mapping
 from logging import Logger
@@ -13,8 +14,9 @@ from tplinkrouterc6u.common.package_enum import Connection
 from tplinkrouterc6u.common.dataclass import Firmware, Status, Device, IPv4Status, LTEStatus, MeshNode
 from tplinkrouterc6u.client_abstract import AbstractRouter
 from tplinkrouterc6u.client.c6u import TplinkEncryption
+from tplinkrouterc6u.client.deco_tmp import DecoTMPTransport, DecoTMPError, DecoTMPRejected
 from tplinkrouterc6u.common.exception import (
-    ClientException, ClientError, WifiWriteNotObserved,
+    ClientException, ClientError, WifiVerificationError, WifiWriteNotObserved,
     WifiVerificationUnavailable, WifiWriteRejected,
 )
 
@@ -53,6 +55,7 @@ class TPLinkDecoClient(TplinkEncryption, AbstractRouter):
         self._headers_request = {'Content-Type': 'application/json'}
         self._headers_login = {'Content-Type': 'application/json'}
         self._data_block = 'result'
+        self._tmp_wifi_options = None
 
     # supports() stays the cheap TplinkEncryption keys probe. SG-stack Halo units
     # are claimed earlier by TplinkDecoSGRouter in TplinkRouterProvider.get_clients().
@@ -84,13 +87,28 @@ class TPLinkDecoClient(TplinkEncryption, AbstractRouter):
         """Whether the one-shot classic Deco transport applies to this client."""
         return type(self)._request_with_reauth is TPLinkDecoClient._request_with_reauth
 
+    def configure_tmp_wifi(self, *, username_sha1: str, host_key_sha256: str) -> None:
+        """Opt in to the local app transport using an explicit identity and pin.
+
+        Validation constructs no connection. The existing password is reused;
+        the caller must ensure it is also valid for the supplied local account.
+        """
+        if not self.supports_verified_wifi:
+            raise ValueError('The app Wi-Fi transport requires a classic Deco client')
+        host = urlsplit(self.host)
+        if host.username is not None or host.password is not None or host.hostname is None:
+            raise ValueError('A router hostname or IP address is required')
+        DecoTMPTransport(host.hostname, username_sha1, self.password, host_key_sha256)
+        self._tmp_wifi_options = (host.hostname, username_sha1, host_key_sha256)
+
     def set_wifi_verified(self, wifi: Connection, enable: bool, attempts: int = 3,
                           poll_interval: float = 1.0) -> WifiWriteResult:
         """Send one minimal write and accept only a subsequent observed state.
 
         The caller must authorize and serialize access to the router session.
         Neither an unreadable write reply nor a timeout permits a second write.
-        All verification requests use only the existing WLAN read endpoint.
+        Confirmation uses only WLAN reads, including the existing HTTP session
+        when an app connection is lost after its one-shot write.
         """
         if not isinstance(wifi, Connection) or wifi not in _WIFI_BANDS:
             raise ValueError('Unsupported Wi-Fi network for Deco verification')
@@ -105,6 +123,9 @@ class TPLinkDecoClient(TplinkEncryption, AbstractRouter):
         # request on their sessions without a separately verified implementation.
         if not self.supports_verified_wifi:
             raise WifiVerificationUnavailable(error_type='UnsupportedTransport') from None
+
+        if self._tmp_wifi_options and _WIFI_BANDS[wifi][1] == 'guest':
+            return self._set_guest_wifi_tmp_verified(wifi, enable, attempts, poll_interval)
 
         band, network = _WIFI_BANDS[wifi]
         payload = {'operation': 'write', 'params': {band: {network: {'enable': enable}}}}
@@ -146,6 +167,73 @@ class TPLinkDecoClient(TplinkEncryption, AbstractRouter):
         if target_observed:
             raise WifiWriteNotObserved(latest_states, error_type) from None
         raise WifiVerificationUnavailable(latest_states, error_type) from None
+
+    def _set_guest_wifi_tmp_verified(self, wifi: Connection, enable: bool,
+                                     attempts: int, poll_interval: float) -> WifiWriteResult:
+        """Read first, send at most one app command, then verify observed WLAN.
+
+        An uncertain app write is never replayed through either transport. This
+        path is enabled only by configure_tmp_wifi; ordinary HTTP reads and all
+        non-guest controls retain their existing behavior.
+        """
+        host, username, pin = self._tmp_wifi_options
+        latest_states = {}
+        try:
+            with DecoTMPTransport(host, username, self.password, pin) as transport:
+                latest_states = self._wifi_states(transport.get_wlan())
+                if wifi not in latest_states:
+                    raise WifiVerificationUnavailable(error_type='TMPStateUnavailable') from None
+                if latest_states[wifi] is enable:
+                    return WifiWriteResult(wifi, enable, latest_states)
+                rejected = False
+                error_type = None
+                read_from_tmp = True
+                try:
+                    transport.set_guest_wifi(wifi, enable)
+                except DecoTMPRejected as error:
+                    rejected = True
+                    error_type = error.error_type
+                    read_from_tmp = False
+                except Exception as error:
+                    error_type = type(error).__name__
+                    read_from_tmp = False
+                target_observed = False
+                for attempt in range(attempts):
+                    if attempt:
+                        sleep(poll_interval)
+                    try:
+                        if read_from_tmp:
+                            try:
+                                response = transport.get_wlan()
+                            except DecoTMPError:
+                                read_from_tmp = False
+                                response = self._wifi_request_once({'operation': 'read'})
+                        else:
+                            response = self._wifi_request_once({'operation': 'read'})
+                        if self._wifi_rejected(response):
+                            error_type = 'RouterRejected'
+                            continue
+                        latest_states = self._wifi_states(response)
+                    except Exception as error:
+                        error_type = type(error).__name__
+                        continue
+                    if rejected:
+                        raise WifiWriteRejected(latest_states, error_type) from None
+                    if wifi in latest_states:
+                        target_observed = True
+                        if latest_states[wifi] is enable:
+                            return WifiWriteResult(wifi, enable, latest_states)
+                if rejected:
+                    raise WifiWriteRejected(latest_states, error_type) from None
+                if target_observed:
+                    raise WifiWriteNotObserved(latest_states, error_type) from None
+                raise WifiVerificationUnavailable(latest_states, error_type) from None
+        except WifiVerificationError:
+            raise
+        except DecoTMPError as error:
+            raise WifiVerificationUnavailable(latest_states, error.error_type) from None
+        except Exception as error:
+            raise WifiVerificationUnavailable(latest_states, type(error).__name__) from None
 
     def _wifi_request_once(self, payload: dict) -> dict | None:
         """Bypass Deco automatic retries/reauthorization for this operation.

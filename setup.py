@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="tplinkrouterc6u",
-    version="5.42.1.dev1",
+    version="5.42.1.dev2",
     author="Alex Erohin",
     author_email="alexanderErohin@yandex.ru",
     description="TP-Link Router API (supports also Mercusys Router)",
@@ -26,5 +26,6 @@ setuptools.setup(
         "Programming Language :: Python :: Implementation :: PyPy",
     ],
     install_requires=['requests', 'pycryptodome', 'macaddress'],
+    extras_require={'deco-tmp': ['paramiko>=3.5,<5']},
     python_requires='>=3.10',
 )
